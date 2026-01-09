@@ -223,10 +223,6 @@ class INPICrawler:
                         except Exception as e:
                             logger.error(f"   ❌ Re-login error: {str(e)}")
                             break
-                                timeout=180000
-                            )
-                        
-                        continue
                 
                 await self.browser.close()
                 
@@ -1005,6 +1001,9 @@ class INPICrawler:
         # ============================================
         # BATCH 3: DEPOSITANTE + TEMPORAL (até 7 queries)
         # Só se depositantes conhecidos
+        # VALIDAÇÃO PÓS-BUSCA: Descartar se resultado NÃO citar:
+        #   - mesmo depositante do WO OU
+        #   - prioridade internacional compatível
         # ============================================
         
         depositor_queries = 0
@@ -1018,10 +1017,20 @@ class INPICrawler:
             for year in [current_year - 1, current_year]:
                 if len(terms) >= 28:  # Limite antes do batch 4
                     break
+                
+                # Armazenar metadados para validação pós-busca
+                query_metadata = {
+                    'query': f"{depositor} {year}",
+                    'depositor': depositor,
+                    'year': year,
+                    'requires_validation': True  # Batch 3 requer validação
+                }
+                
                 terms.append(f"{depositor} {year}")
                 depositor_queries += 1
         
         logger.info(f"   📦 Batch 3 (Depositante+Temporal): {depositor_queries} terms")
+        logger.info(f"   ⚠️  Batch 3 results require post-validation (depositor match)")
         
         # ============================================
         # BATCH 4: PREFIXOS BR RECENTES (até 7 queries)
