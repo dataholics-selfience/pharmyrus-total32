@@ -25,7 +25,6 @@ import base64
 import asyncio
 import re
 import json
-from os import getenv
 from datetime import datetime, timedelta
 import logging
 
@@ -131,9 +130,9 @@ COUNTRY_CODES = {
 }
 
 app = FastAPI(
-    title="Pharmyrus v32.0-WIPO-MINIMAL",
-    description="4-Layer Patent Search: WIPO (optional) + EPO OPS + Google Patents + INPI (Minimal changes, WIPO added before EPO)",
-    version="v32.0-WIPO-MINIMAL"
+    title="Pharmyrus v30.1-FINAL",
+    description="3-Layer Patent Search: EPO OPS + Google Patents (Playwright) + INPI (Complete 18-field Parse + Intelligent Merge + Patent Families)",
+    version="30.1-FINAL"
 )
 
 app.add_middleware(
@@ -1033,46 +1032,15 @@ async def search_patents(request: SearchRequest, progress_callback=None):
         progress_callback(5, "Initializing search...")
     
     async with httpx.AsyncClient() as client:
-        pubchem = await get_pubchem_data(client, molecule)
-        logger.info(f"   PubChem: {len(pubchem['dev_codes'])} dev codes, CAS: {pubchem['cas']}")
-        
-        wipo_wos = set()
-        
-        # ===== LAYER 0.5: WIPO (OPCIONAL) =====
-        if request.incluir_wo:
-            if progress_callback:
-                progress_callback(8, "Searching WIPO PCT...")
-            
-            logger.info("🌐 LAYER 0.5: WIPO PatentScope (PCT root)")
-            
-            groq_key = getenv("GROQ_API_KEY")
-            
-            try:
-                wipo_patents = await search_wipo_patents(
-                    molecule=molecule,
-                    dev_codes=pubchem["dev_codes"],
-                    cas=pubchem["cas"],
-                    max_results=50,
-                    groq_api_key=groq_key
-                )
-                
-                wipo_wos = {w['wo_number'] for w in wipo_patents if 'wo_number' in w}
-                logger.info(f"   ✅ WIPO: {len(wipo_wos)} WO patents")
-                
-                if progress_callback:
-                    progress_callback(10, f"WIPO: {len(wipo_wos)} WOs found")
-            except Exception as e:
-                logger.error(f"   ❌ WIPO search failed: {e}")
-        else:
-            logger.info("   ⏭️  WIPO: Skipped (incluir_wo=False)")
-        
         # ===== LAYER 1: EPO (CÓDIGO COMPLETO v26) =====
         if progress_callback:
-            progress_callback(12, "Searching EPO OPS...")
+            progress_callback(10, "Searching EPO OPS...")
         
         logger.info("🔵 LAYER 1: EPO OPS (FULL)")
         
         token = await get_epo_token(client)
+        pubchem = await get_pubchem_data(client, molecule)
+        logger.info(f"   PubChem: {len(pubchem['dev_codes'])} dev codes, CAS: {pubchem['cas']}")
         
         if progress_callback:
             progress_callback(15, "Building EPO queries...")
@@ -1146,7 +1114,7 @@ async def search_patents(request: SearchRequest, progress_callback=None):
             progress_callback(55, f"Google complete: {len(google_wos)} additional WOs")
         
         # Merge WOs
-        all_wos = wipo_wos | epo_wos | google_wos
+        all_wos = epo_wos | google_wos
         logger.info(f"   ✅ Total WOs (EPO + Google): {len(all_wos)}")
         
         # ===== LAYER 3: INPI BRAZILIAN PATENTS =====
@@ -1872,3 +1840,4 @@ def execute_search_sync(molecule: str, countries: list, include_wipo: bool = Fal
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
