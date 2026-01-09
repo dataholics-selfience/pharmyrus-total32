@@ -86,7 +86,7 @@ class INPICrawler:
             logger.info(f"      Brand: {brand} → {brand_pt}")
         
         # Build search terms (INCLUINDO brand_pt!)
-        search_terms = self._build_search_terms(molecule_pt, brand_pt, dev_codes, max_terms=50)
+        search_terms = self._build_search_terms(molecule_pt, brand_pt, dev_codes, max_terms=35)
         
         logger.info(f"   📋 {len(search_terms)} search terms generated")
         logger.info(f"   🔐 Starting INPI search with LOGIN ({username})...")
@@ -136,43 +136,93 @@ class INPICrawler:
                     await self.browser.close()
                     return all_patents
                 
-                # STEP 3: Search each term (TÍTULO + RESUMO)
-                for i, term in enumerate(search_terms, 1):
-                    logger.info(f"   🔍 INPI search {i}/{len(search_terms)}: '{term}'")
+                # STEP 3: Search each term in BATCHES with re-login
+                # Batch size: 7 queries (14 searches: título + resumo)
+                # Re-login after each batch to avoid timeout
+                
+                BATCH_SIZE = 7
+                total_batches = (len(search_terms) + BATCH_SIZE - 1) // BATCH_SIZE
+                
+                logger.info(f"   📦 Splitting {len(search_terms)} terms into {total_batches} batches of {BATCH_SIZE}")
+                
+                for batch_num in range(total_batches):
+                    start_idx = batch_num * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(search_terms))
+                    batch_terms = search_terms[start_idx:end_idx]
                     
-                    try:
-                        # Search by TÍTULO
-                        patents_titulo = await self._search_term_basic(term, field="Titulo")
-                        all_patents.extend(patents_titulo)
+                    logger.info(f"   📦 BATCH {batch_num + 1}/{total_batches}: {len(batch_terms)} terms")
+                    
+                    # Search each term in this batch (TÍTULO + RESUMO)
+                    for i, term in enumerate(batch_terms, 1):
+                        global_idx = start_idx + i
+                        logger.info(f"   🔍 INPI search {global_idx}/{len(search_terms)}: '{term}'")
                         
-                        await asyncio.sleep(3)  # Delay between searches
-                        
-                        # Search by RESUMO
-                        patents_resumo = await self._search_term_basic(term, field="Resumo")
-                        all_patents.extend(patents_resumo)
-                        
-                        await asyncio.sleep(3)
-                        
-                    except Exception as e:
-                        logger.warning(f"      ⚠️  Error searching '{term}': {str(e)}")
-                        
-                        # Check if session expired
-                        if await self._check_session_expired():
-                            logger.error("   ❌ Session expired! Attempting re-login...")
+                        try:
+                            # Search by TÍTULO
+                            patents_titulo = await self._search_term_basic(term, field="Titulo")
+                            all_patents.extend(patents_titulo)
                             
-                            # Try to re-login
+                            await asyncio.sleep(3)  # Delay between searches
+                            
+                            # Search by RESUMO
+                            patents_resumo = await self._search_term_basic(term, field="Resumo")
+                            all_patents.extend(patents_resumo)
+                            
+                            await asyncio.sleep(3)
+                            
+                        except Exception as e:
+                            logger.warning(f"      ⚠️  Error searching '{term}': {str(e)}")
+                            continue
+                    
+                    # RE-LOGIN after each batch (except last)
+                    if batch_num < total_batches - 1:
+                        logger.info(f"   🔄 Batch {batch_num + 1} complete. Re-login before next batch...")
+                        
+                        try:
+                            # Close current session
+                            await self.browser.close()
+                            await asyncio.sleep(2)
+                            
+                            # Re-launch browser
+                            self.browser = await p.chromium.launch(
+                                headless=True,
+                                args=[
+                                    '--disable-blink-features=AutomationControlled',
+                                    '--disable-dev-shm-usage',
+                                    '--no-sandbox',
+                                    '--disable-setuid-sandbox'
+                                ]
+                            )
+                            
+                            self.context = await self.browser.new_context(
+                                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                viewport={'width': 1920, 'height': 1080},
+                                locale='pt-BR'
+                            )
+                            
+                            self.page = await self.context.new_page()
+                            
+                            # Re-login
                             relogin = await self._login(username, password)
                             if not relogin:
                                 logger.error("   ❌ Re-login failed! Stopping INPI search")
                                 break
                             
-                            logger.info("   ✅ Re-login successful! Continuing...")
+                            logger.info("   ✅ Re-login successful!")
                             self.session_active = True
                             
                             # Go back to search page
                             await self.page.goto(
                                 "https://busca.inpi.gov.br/pePI/jsp/patentes/PatenteSearchBasico.jsp",
                                 wait_until='networkidle',
+                                timeout=180000
+                            )
+                            
+                            await asyncio.sleep(3)
+                            
+                        except Exception as e:
+                            logger.error(f"   ❌ Re-login error: {str(e)}")
+                            break
                                 timeout=180000
                             )
                         
@@ -877,19 +927,149 @@ class INPICrawler:
         molecule: str,
         brand: str,
         dev_codes: List[str],
-        max_terms: int = 50  # ← AUMENTADO para acomodar todas estratégias
+        pubchem_synonyms: List[str] = None,
+        depositors: List[str] = None,
+        max_terms: int = 35
     ) -> List[str]:
         """
-        Build search terms from molecule, brand, dev codes
-        EXPANDIDO v28.0: 6 estratégias paralelas
+        Build search terms - ESTRATÉGIA v29 FINAL
         
-        Estratégias:
-        1. Textual Multi-Term (molecule, brand, dev codes)
-        2. IPC/CPC Pharmaceutical codes
-        3. Formulations (pharmaceutical forms)
-        4. Polymorphs & Salts (derivatives)
-        5. Combinations (molecule + terms)
-        6. Variations (without spaces, hyphens)
+        Baseado em IDENTIDADE, não em classes genéricas
+        Batches de 7 queries com re-login
+        
+        Args:
+            molecule: Molecule name (Portuguese)
+            brand: Brand name (Portuguese)
+            dev_codes: Development codes
+            pubchem_synonyms: PubChem synonyms (optional)
+            depositors: Known depositors from WOs (optional)
+            max_terms: Maximum terms (35 = 5 batches × 7)
+        
+        Returns:
+            List of search terms organized in batches
+        """
+        terms = []
+        pubchem_synonyms = pubchem_synonyms or []
+        depositors = depositors or []
+        
+        # ============================================
+        # BATCH 1: IDENTIDADE MOLECULAR (7 queries)
+        # PRIORIDADE MÁXIMA
+        # ============================================
+        
+        if molecule:
+            terms.append(molecule.strip())
+        
+        if brand and brand != molecule:
+            terms.append(brand.strip())
+        
+        # Dev codes (top 5)
+        for code in dev_codes[:5]:
+            if code and len(code) > 2:
+                terms.append(code.strip())
+        
+        # Preencher até 7 com variações
+        if molecule and ' ' in molecule and len(terms) < 7:
+            terms.append(molecule.replace(' ', '').strip())
+        
+        # Variações dev codes sem hífen
+        for code in dev_codes[:5]:
+            if code and '-' in code and len(terms) < 7:
+                terms.append(code.replace('-', '').strip())
+        
+        batch_1_count = min(len(terms), 7)
+        logger.info(f"   📦 Batch 1 (Identidade): {batch_1_count} terms")
+        
+        # ============================================
+        # BATCH 2: SINÔNIMOS PUBCHEM (7 queries)
+        # Filtrados (não genéricos)
+        # ============================================
+        
+        valid_synonyms = []
+        generic_terms = ['salt', 'hydrate', 'formulation', 'composition', 'compound']
+        
+        for syn in pubchem_synonyms:
+            if not syn or len(syn) < 3:
+                continue
+            if any(gen in syn.lower() for gen in generic_terms):
+                continue
+            if syn.lower() in [molecule.lower(), brand.lower()]:
+                continue  # Já incluído
+            valid_synonyms.append(syn.strip())
+        
+        for syn in valid_synonyms[:7]:
+            terms.append(syn)
+        
+        logger.info(f"   📦 Batch 2 (Sinônimos): {len(valid_synonyms[:7])} terms")
+        
+        # ============================================
+        # BATCH 3: DEPOSITANTE + TEMPORAL (até 7 queries)
+        # Só se depositantes conhecidos
+        # ============================================
+        
+        depositor_queries = 0
+        current_year = 2026  # Update yearly
+        
+        for depositor in depositors[:3]:  # Max 3 depositantes
+            if not depositor:
+                continue
+            
+            # Buscar últimos 2 anos
+            for year in [current_year - 1, current_year]:
+                if len(terms) >= 28:  # Limite antes do batch 4
+                    break
+                terms.append(f"{depositor} {year}")
+                depositor_queries += 1
+        
+        logger.info(f"   📦 Batch 3 (Depositante+Temporal): {depositor_queries} terms")
+        
+        # ============================================
+        # BATCH 4: PREFIXOS BR RECENTES (até 7 queries)
+        # Só com depositante conhecido
+        # ============================================
+        
+        prefix_queries = 0
+        
+        if depositors:
+            for depositor in depositors[:2]:  # Max 2 depositantes
+                for year_suffix in ['24', '25', '26']:  # 2024-2026
+                    if len(terms) >= 35:
+                        break
+                    terms.append(f"BR112{year_suffix} {depositor}")
+                    prefix_queries += 1
+                    if prefix_queries >= 7:
+                        break
+        
+        logger.info(f"   📦 Batch 4 (Prefixos BR): {prefix_queries} terms")
+        
+        # ============================================
+        # BATCH 5: RESERVA/VARIAÇÕES (completar até 35)
+        # ============================================
+        
+        # Preencher com mais variações se necessário
+        while len(terms) < 35:
+            # Adicionar mais dev codes se disponíveis
+            for code in dev_codes[5:10]:
+                if len(terms) >= 35:
+                    break
+                if code and len(code) > 2:
+                    terms.append(code.strip())
+            break
+        
+        # Garantir max 35
+        terms_list = terms[:max_terms]
+        
+        logger.info(f"   📋 TOTAL: {len(terms_list)} search terms")
+        logger.info(f"   🎯 Strategy: Identity-based + Depositor temporal + BR prefixes")
+        
+        return terms_list
+        """
+        Build search terms - ESTRATÉGIA CORTELLIS v28.1
+        
+        MUDANÇA CRÍTICA: Termos ISOLADOS (sem combinar com molécula)
+        Baseado em Cortellis Patent Type Classification
+        
+        Batches de 7 queries com re-login automático entre batches
         
         Args:
             molecule: Molecule name (in Portuguese!)
@@ -898,106 +1078,121 @@ class INPICrawler:
             max_terms: Maximum number of terms
         
         Returns:
-            List of search terms (will search both TÍTULO and RESUMO)
+            List of search terms organized in batches
         """
-        terms = set()
+        terms = []
         
         # ============================================
-        # ESTRATÉGIA 1: TEXTUAL MULTI-TERM (Original)
+        # BATCH 1: ESSENCIAIS (7 queries)
+        # PRIORIDADE: Molécula PT-BR SEMPRE PRIMEIRO!
         # ============================================
+        
+        # 1. Molécula (PRIORIDADE MÁXIMA)
         if molecule:
-            terms.add(molecule.strip())
+            terms.append(molecule.strip())
         
+        # 2. Brand
         if brand and brand != molecule:
-            terms.add(brand.strip())
+            terms.append(brand.strip())
         
-        # Dev codes (limit to avoid too many searches)
-        for code in dev_codes[:6]:  # Max 6 dev codes
+        # 3-5. Dev codes (top 3)
+        for code in dev_codes[:3]:
             if code and len(code) > 2:
-                terms.add(code.strip())
+                terms.append(code.strip())
+        
+        # 6. CAS number (se presente nos dev_codes)
+        for code in dev_codes:
+            if re.match(r'^\d{2,7}-\d{2}-\d$', code):  # Formato CAS
+                terms.append(code.strip())
+                break
+        
+        # 7. Molécula sem espaços (variação)
+        if molecule and ' ' in molecule:
+            terms.append(molecule.replace(' ', '').strip())
+        
+        # Garantir batch 1 = 7 terms (ou menos se não houver dados)
+        batch_1_count = len(terms)
+        logger.info(f"   📦 Batch 1 (Essenciais): {batch_1_count} terms")
         
         # ============================================
-        # ESTRATÉGIA 2: IPC/CPC PHARMACEUTICAL
+        # BATCH 2: DERIVADOS - Patent Type "Product derivative" (7 queries)
+        # Termos ISOLADOS (sem molécula)
         # ============================================
-        # Buscar molécula + classificação IPC farmacêutica
-        ipc_codes = ['A61K', 'A61P', 'A61K9', 'A61K31', 'A61K47']
-        for ipc in ipc_codes:
-            if molecule:
-                terms.add(f"{molecule} {ipc}")
+        
+        derivative_terms = [
+            'polimorfo',
+            'forma cristalina',
+            'cloridrato',
+            'sulfato',
+            'fosfato',
+            'hidrato',
+            'sal farmaceutico'
+        ]
+        
+        for term in derivative_terms[:7]:
+            terms.append(term)
+        
+        logger.info(f"   📦 Batch 2 (Derivados): 7 terms")
         
         # ============================================
-        # ESTRATÉGIA 3: FORMULATIONS
+        # BATCH 3: FORMULAÇÕES - Patent Type "Formulation" (7 queries)
+        # Termos ISOLADOS (sem molécula)
         # ============================================
-        # Termos de formulação farmacêutica (português)
+        
         formulation_terms = [
             'comprimido',
             'capsula',
             'injetavel',
-            'formulacao',
+            'formulacao farmaceutica',
             'composicao farmaceutica',
             'liberacao controlada',
-            'liberacao sustentada',
+            'liberacao sustentada'
         ]
         
-        for form_term in formulation_terms:
-            if molecule:
-                terms.add(f"{molecule} {form_term}")
+        for term in formulation_terms[:7]:
+            terms.append(term)
+        
+        logger.info(f"   📦 Batch 3 (Formulações): 7 terms")
         
         # ============================================
-        # ESTRATÉGIA 4: POLYMORPHS & SALTS
+        # BATCH 4: IPC CODES - Classificação farmacêutica (7 queries)
+        # Termos ISOLADOS (sem molécula)
         # ============================================
-        # Termos de polimorfos e sais (português)
-        derivative_terms = [
-            'polimorfo',
-            'forma cristalina',
-            'sal',
-            'hidrato',
-            'solvato',
-            'anidro',
-            'cloridrato',
-            'sulfato',
-            'fosfato',
+        
+        ipc_codes = [
+            'A61K',      # Medicamentos
+            'A61P',      # Atividade terapêutica
+            'A61K9',     # Formas de dosagem
+            'A61K31',    # Compostos orgânicos
+            'A61K47',    # Excipientes
+            'C07D',      # Compostos heterocíclicos
+            'A61P35'     # Antineoplástico
         ]
         
-        for der_term in derivative_terms:
-            if molecule:
-                terms.add(f"{molecule} {der_term}")
+        for ipc in ipc_codes[:7]:
+            terms.append(ipc)
+        
+        logger.info(f"   📦 Batch 4 (IPC Codes): 7 terms")
         
         # ============================================
-        # ESTRATÉGIA 5: COMBINATIONS
+        # BATCH 5: COMBINAÇÕES ESPECÍFICAS (até 7 queries)
+        # EXCEÇÃO: Única combinação que faz sentido
         # ============================================
-        # Combinações molecule + brand
+        
+        # Combinação molécula + brand (se ambos existem)
         if molecule and brand and brand != molecule:
-            terms.add(f"{molecule} {brand}")
+            terms.append(f"{molecule} {brand}")
         
-        # Molecule + primeiro dev code
-        if molecule and dev_codes and len(dev_codes) > 0:
-            terms.add(f"{molecule} {dev_codes[0]}")
+        # Variações sem hífen para dev codes
+        for code in dev_codes[:3]:
+            if code and '-' in code:
+                terms.append(code.replace('-', ''))
         
-        # ============================================
-        # ESTRATÉGIA 6: VARIATIONS
-        # ============================================
-        # Variações sem espaço/hífen para capturar formatos diferentes
-        if molecule:
-            # Remove espaços
-            molecule_nospace = molecule.replace(' ', '')
-            if molecule_nospace != molecule:
-                terms.add(molecule_nospace)
-            
-            # Remove hífens
-            molecule_nohyphen = molecule.replace('-', '')
-            if molecule_nohyphen != molecule:
-                terms.add(molecule_nohyphen)
+        # Garantir max 35 terms (5 batches × 7)
+        terms_list = terms[:max_terms]
         
-        if brand and brand != molecule:
-            brand_nospace = brand.replace(' ', '')
-            if brand_nospace != brand:
-                terms.add(brand_nospace)
-        
-        # Convert to list and limit
-        terms_list = list(terms)[:max_terms]
-        
-        logger.info(f"   📋 Generated {len(terms_list)} search terms across 6 strategies")
+        logger.info(f"   📋 TOTAL: {len(terms_list)} search terms across 5 batches")
+        logger.info(f"   🎯 Strategy: Isolated terms (Cortellis-based) + batch re-login")
         
         return terms_list
     

@@ -38,6 +38,12 @@ from inpi_crawler import inpi_crawler
 # Import WIPO Crawler Layer 5 (NOVO v32.0)
 from wipo_crawler import search_wipo_patents
 
+# Import BR Inference Module (v29)
+from br_inference import BRPendingInference
+
+# Import Cortellis Audit Module (v29)
+from cortellis_audit import CortellisAudit
+
 # Import Merge Logic
 from merge_logic import merge_br_patents
 
@@ -1506,6 +1512,39 @@ async def search_patents(request: SearchRequest, progress_callback=None):
         logger.info(f"   - {len(all_patents)} total patents")
         logger.info(f"   - {len(patent_families)} families")
         
+        # ===== AUDITORIA CORTELLIS (v29) =====
+        logger.info("📊 Running Cortellis audit...")
+        audit = CortellisAudit()
+        
+        br_numbers = [p['patent_number'] for p in patents_by_country.get('BR', [])]
+        audit_report = audit.audit_results(
+            molecule=molecule,
+            found_brs=br_numbers
+        )
+        
+        logger.info(f"   Audit: {audit_report.get('vs_cortellis', {}).get('rating', 'N/A')}")
+        
+        # ===== INFERÊNCIA BR PENDENTE (v29) =====
+        logger.info("🔮 Inferring pending BRs from recent WOs...")
+        br_inference = BRPendingInference()
+        
+        # Extrair detalhes WOs para inferência
+        wo_details = []
+        for patent in all_patents:
+            if patent.get('patent_number', '').startswith('WO'):
+                wo_details.append({
+                    'patent_number': patent['patent_number'],
+                    'applicant': patent.get('applicants', [''])[0] if patent.get('applicants') else ''
+                })
+        
+        pending_brs = br_inference.infer_pending_brs(
+            wos=list(all_wos),
+            wo_details=wo_details,
+            found_brs=br_numbers
+        )
+        
+        logger.info(f"   Inferred: {len(pending_brs)} pending BRs")
+        
         response_data = {
             "metadata": {
                 "search_id": f"{molecule}_{int(datetime.now().timestamp())}",
@@ -1569,6 +1608,10 @@ async def search_patents(request: SearchRequest, progress_callback=None):
                 "patents_by_country": patents_by_country,
                 "all_patents": all_patents
             },
+            
+            "cortellis_audit": audit_report,  # ✅ NOVO v29: Auditoria vs Cortellis
+            
+            "pending_brs_inferred": pending_brs,  # ✅ NOVO v29: BRs pendentes inferidas
             
             "research_and_development": {
                 "molecular_data": {

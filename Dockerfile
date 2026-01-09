@@ -17,6 +17,8 @@ COPY merge_logic.py .
 COPY patent_cliff.py .
 COPY celery_app.py .
 COPY tasks.py .
+COPY br_inference.py .
+COPY cortellis_audit.py .
 
 # Railway uses PORT env variable
 ENV PORT=8080
